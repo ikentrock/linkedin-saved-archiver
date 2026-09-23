@@ -1,0 +1,10 @@
+{
+  "webapp_url": "https://script.google.com/macros/s/PASTE-YOUR-DEPLOYMENT-ID/exec",
+  "token": "CHANGE-ME-to-a-long-random-string",
+  "unsave": true,
+  "max_posts_per_run": 25,
+  "delay_seconds": [3, 7],
+  "browser_channel": "chrome",
+  "locale": "en-US",
+  "extra_unsave_labels": []
+}
