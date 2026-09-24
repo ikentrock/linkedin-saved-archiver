@@ -36,6 +36,12 @@ POST_URL = "https://www.linkedin.com/feed/update/{urn}/"
 # Menu labels for "Unsave" in English and Spanish LinkedIn UIs (config can add more).
 UNSAVE_LABELS = ["unsave", "dejar de guardar", "no guardar", "eliminar de guardad", "quitar de guardad"]
 URN_RE = re.compile(r"urn:li:(activity|ugcPost|share):(\d+)")
+CHECKPOINT_MARKERS = ("/checkpoint", "/challenge", "/authwall")
+LOGIN_MARKERS = ("/login", "/uas/")
+
+
+class Blocked(Exception):
+    """LinkedIn showed a security check or logged us out; stop touching the site."""
 
 
 # ---------------------------------------------------------------- helpers
@@ -122,10 +128,21 @@ class Sheet:
 
 # ---------------------------------------------------------------- LinkedIn
 
-def ensure_logged_in(page):
+def check_blocked(page):
+    url = page.url
+    if any(m in url for m in CHECKPOINT_MARKERS):
+        raise Blocked("LinkedIn security check (checkpoint) page")
+    if any(m in url for m in LOGIN_MARKERS):
+        raise Blocked("LinkedIn logged the session out")
+
+
+def ensure_logged_in(page, wait=True):
     page.goto(SAVED_URL, wait_until="domcontentloaded")
     if "/login" not in page.url and "my-items" in page.url:
         return
+    if not wait:
+        check_blocked(page)
+        raise Blocked(f"unexpected page instead of saved posts: {page.url}")
     log("Not logged in. Please log in to LinkedIn in the opened browser window "
         "(you have 5 minutes). Your session is kept for next runs.")
     deadline = time.time() + 300
@@ -314,6 +331,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="extract and print only; no sheet, no unsave")
     ap.add_argument("--no-unsave", action="store_true", help="write to sheet but keep posts saved")
     ap.add_argument("--debug", action="store_true", help="save screenshots/HTML when something fails")
+    ap.add_argument("--unattended", action="store_true",
+                    help="never wait for a manual login; stop at once if logged out (for scheduled runs)")
     args = ap.parse_args()
 
     cfg = load_json(CONFIG_PATH, None)
@@ -333,71 +352,86 @@ def main():
     counts = {"archived": 0, "duplicate": 0, "unsaved": 0, "skipped": 0}
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    blocked = None
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             str(PROFILE_DIR), headless=False, channel=cfg.get("browser_channel") or None,
             viewport={"width": 1280, "height": 900}, locale=cfg.get("locale", "en-US"))
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        ensure_logged_in(page)
-        page.wait_for_timeout(2500)
-
-        # Ask for a few extra in case some fail or were unsaved earlier.
-        items = collect_saved(page, cfg, limit + 10)
-        items = [(pid, urn) for pid, urn in items if pid not in state["unsaved"]][:limit]
-        log(f"Found {len(items)} saved posts to process.")
-        if not items and args.debug:
-            dump_debug(page, "saved_list")
-
-        post_page = ctx.new_page()
-        for n, (pid, urn) in enumerate(items, 1):
-            log(f"[{n}/{len(items)}] {urn}")
-            try:
-                data, url = extract_post(post_page, urn, pid)
-            except Exception as e:  # noqa: BLE001
-                data, url = None, POST_URL.format(urn=urn)
-                log(f"  extraction error: {e}")
-
-            if not data or not (data.get("text") or data.get("author")):
-                log("  could not read post content — skipping (left saved).")
-                counts["skipped"] += 1
-                state["failed"][pid] = "extract"
-                if args.debug:
-                    dump_debug(post_page, f"post_{pid}")
-                continue
-
-            if args.dry_run:
-                print(json.dumps(data, ensure_ascii=False, indent=2))
-                pause(cfg)
-                continue
-
-            status = "duplicate" if pid in known else sheet.append(data)
-            if status not in ("appended", "duplicate"):
-                log(f"  sheet did not confirm the row ({status}) — leaving post saved.")
-                counts["skipped"] += 1
-                state["failed"][pid] = status
-                continue
-            counts["archived" if status == "appended" else "duplicate"] += 1
-            log(f"  {status} in sheet: {data['author']} — {data['text'][:60]!r}")
-
-            if do_unsave:
-                if unsave_post(post_page, extra_labels):
-                    counts["unsaved"] += 1
-                    state["unsaved"].append(pid)
-                    state["failed"].pop(pid, None)
-                    sheet.set_status(pid, "Unsaved on LinkedIn")
-                    log("  unsaved on LinkedIn.")
-                else:
-                    log("  could not find the Unsave option — left saved.")
-                    state["failed"][pid] = "unsave"
-                    if args.debug:
-                        dump_debug(post_page, f"unsave_{pid}")
-
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            ensure_logged_in(page, wait=not args.unattended)
+            page.wait_for_timeout(2500)
+            process(ctx, page, cfg, args, limit, sheet, known, state, counts, do_unsave, extra_labels)
+        except Blocked as e:
+            blocked = str(e)
+        finally:
             STATE_PATH.write_text(json.dumps(state, indent=1))
-            pause(cfg)
+            ctx.close()
 
-        ctx.close()
-
+    if blocked:
+        log(f"STOPPED: {blocked}. No further LinkedIn requests were made. "
+            "Open LinkedIn by hand, clear the check/log in, and wait before the next run.")
     log("Done. " + ", ".join(f"{k}: {v}" for k, v in counts.items()))
+    if blocked:
+        sys.exit(4)
+
+
+def process(ctx, page, cfg, args, limit, sheet, known, state, counts, do_unsave, extra_labels):
+    # Ask for a few extra in case some fail or were unsaved earlier.
+    items = collect_saved(page, cfg, limit + 10)
+    check_blocked(page)
+    items = [(pid, urn) for pid, urn in items if pid not in state["unsaved"]][:limit]
+    log(f"Found {len(items)} saved posts to process.")
+    if not items and args.debug:
+        dump_debug(page, "saved_list")
+
+    post_page = ctx.new_page()
+    for n, (pid, urn) in enumerate(items, 1):
+        log(f"[{n}/{len(items)}] {urn}")
+        try:
+            data, url = extract_post(post_page, urn, pid)
+        except Exception as e:  # noqa: BLE001
+            data, url = None, POST_URL.format(urn=urn)
+            log(f"  extraction error: {e}")
+        check_blocked(post_page)
+
+        if not data or not (data.get("text") or data.get("author")):
+            log("  could not read post content — skipping (left saved).")
+            counts["skipped"] += 1
+            state["failed"][pid] = "extract"
+            if args.debug:
+                dump_debug(post_page, f"post_{pid}")
+            continue
+
+        if args.dry_run:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+            pause(cfg)
+            continue
+
+        status = "duplicate" if pid in known else sheet.append(data)
+        if status not in ("appended", "duplicate"):
+            log(f"  sheet did not confirm the row ({status}) — leaving post saved.")
+            counts["skipped"] += 1
+            state["failed"][pid] = status
+            continue
+        counts["archived" if status == "appended" else "duplicate"] += 1
+        log(f"  {status} in sheet: {data['author']} — {data['text'][:60]!r}")
+
+        if do_unsave:
+            if unsave_post(post_page, extra_labels):
+                counts["unsaved"] += 1
+                state["unsaved"].append(pid)
+                state["failed"].pop(pid, None)
+                sheet.set_status(pid, "Unsaved on LinkedIn")
+                log("  unsaved on LinkedIn.")
+            else:
+                log("  could not find the Unsave option — left saved.")
+                state["failed"][pid] = "unsave"
+                if args.debug:
+                    dump_debug(post_page, f"unsave_{pid}")
+
+        STATE_PATH.write_text(json.dumps(state, indent=1))
+        pause(cfg)
 
 
 if __name__ == "__main__":

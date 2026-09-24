@@ -37,6 +37,7 @@ A browser window opens. Log in to LinkedIn the first time (the session is kept i
 python archiver.py --no-unsave --limit 10   # fill the sheet, keep posts saved
 python archiver.py                          # archive + unsave (25 per run by default)
 python archiver.py --debug                  # save screenshots/HTML when something fails
+python archiver.py --unattended             # scheduled runs: never wait for a manual login
 ```
 
 ## Safety rules built in
@@ -44,8 +45,11 @@ python archiver.py --debug                  # save screenshots/HTML when somethi
   (the Apps Script reads the row back after writing).
 - If the text or author can't be read, the post is skipped and stays saved.
 - Posts already in the sheet are never duplicated (dedupe by Post ID).
-- Random 3–7 s pauses and a per-run cap keep traffic human-paced. LinkedIn's terms
-  restrict automated access, so keep runs small and occasional.
+- Random pauses and a per-run cap keep traffic human-paced. LinkedIn's terms
+  restrict automated access, so keep runs small and occasional: running hundreds
+  of posts in one session gets the account flagged for "unusual activity".
+- If any page lands on a LinkedIn security check (checkpoint) or login page, the run
+  stops at once, saves its progress and exits with code 4.
 
 ## Columns
 Archived At · Post URL · Post ID · Author · Author Headline · Author Profile URL ·
