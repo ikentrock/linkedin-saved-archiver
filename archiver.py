@@ -87,14 +87,24 @@ class Sheet:
 
     def call(self, payload):
         payload = {"token": self.token, **payload}
-        r = requests.post(self.url, data=json.dumps(payload),
-                          headers={"Content-Type": "text/plain;charset=utf-8"},
-                          timeout=60, allow_redirects=True)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"Sheet error: {data.get('error')}")
-        return data
+        last_err = None
+        for attempt in range(4):
+            if attempt:
+                time.sleep(2 * attempt)
+            r = requests.post(self.url, data=json.dumps(payload),
+                              headers={"Content-Type": "text/plain;charset=utf-8"},
+                              timeout=60, allow_redirects=True)
+            try:
+                r.raise_for_status()
+                data = r.json()
+            except (requests.exceptions.RequestException, ValueError) as e:
+                last_err = e
+                log(f"  (sheet call failed, retrying: {e})")
+                continue
+            if not data.get("ok"):
+                raise RuntimeError(f"Sheet error: {data.get('error')}")
+            return data
+        raise RuntimeError(f"Sheet unreachable after retries: {last_err}")
 
     def known_ids(self):
         return set(self.call({"action": "known_ids"})["ids"])
